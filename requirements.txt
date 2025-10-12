@@ -4,3 +4,9 @@ faiss-cpu
 sentence-transformers
 google-generativeai
 numpy
+requests
+gTTS
+SpeechRecognition
+streamlit-lottie
+pyttsx3; platform_system=="Windows"
+google-generativeai
