@@ -75,6 +75,10 @@ K = st.sidebar.slider("Top K chunks to retrieve", 1, 10, 5)
 USE_GEMINI = st.sidebar.checkbox("Use Gemini (requires API key)", True if gemini_key else False)
 AUTO_READ = st.sidebar.checkbox("Auto-read answer after submission", value=False)
 ENABLE_VOICE = st.sidebar.checkbox("Enable voice features (experimental)", value=False)
+# TTS options
+st.sidebar.markdown("---")
+TTS_CHARS_LIMIT = st.sidebar.slider("Max characters to TTS (helps speed)", 200, 4000, 1200)
+USE_LOCAL_TTS = st.sidebar.checkbox("Use local TTS (pyttsx3) if available", value=False)
 
 # ---------------------------
 # Lottie Loader
@@ -97,6 +101,7 @@ lottie_json = load_lottie_url(LOTTIE_URL) if LOTTIE else None
 # ---------------------------
 st.session_state.setdefault("query_text", "")
 st.session_state.setdefault("voice_text", "")
+st.session_state.setdefault("voice_audio_bytes", None)
 st.session_state.setdefault("spinner_counter", 0)
 st.session_state.setdefault("play_audio", False)
 st.session_state.setdefault("audio_bytes", None)
@@ -106,10 +111,11 @@ st.session_state.setdefault("status_message", "")
 st.session_state.setdefault("last_error_trace", "")
 
 # ---------------------------
-# Voice Recognition
+# Voice Recognition (browser-first)
 # ---------------------------
 
 def can_use_microphone() -> bool:
+    """Server-side microphone availability check (only relevant for local dev)."""
     if not ENABLE_VOICE:
         return False
     try:
@@ -120,8 +126,27 @@ def can_use_microphone() -> bool:
 
 
 def listen_to_voice():
+    """Browser recorder first (works on Streamlit Cloud). Falls back to server mic only for local dev.
+    Stores WAV bytes in st.session_state['voice_audio_bytes'] when recording completes.
+    """
+    # Try browser recorder component
+    try:
+        from streamlit_audio_recorder import audio_recorder
+    except Exception:
+        audio_recorder = None
+
+    if audio_recorder is not None:
+        st.markdown("<div class='center-msg'>🎤 Click the record button, speak, then click Stop. Then click 'Submit' to transcribe.</div>", unsafe_allow_html=True)
+        rec = audio_recorder()  # returns WAV bytes or None
+        if rec is None:
+            return
+        st.session_state["voice_audio_bytes"] = rec
+        st.success("✅ Recording captured. Click Submit to transcribe and run the query.")
+        return
+
+    # Fallback to server-side mic (only works locally if pyaudio is installed)
     if not can_use_microphone():
-        st.error("Microphone not available or voice features are disabled. Ensure pyaudio is installed and Streamlit has access to microphone when running locally.")
+        st.error("Microphone not available or voice features are disabled. For cloud deployments use the browser recorder (enable streamlit-audio-recorder in requirements).")
         return
 
     r = sr.Recognizer()
@@ -142,6 +167,33 @@ def listen_to_voice():
         st.error("❌ Could not understand audio.")
     except sr.RequestError:
         st.error("❌ Speech recognition service unavailable.")
+
+
+def transcribe_recording_and_set_text():
+    """Transcribe WAV bytes from st.session_state['voice_audio_bytes'] using SpeechRecognition.
+    Sets voice_text and query_text on success. Returns True if transcription succeeded.
+    """
+    wav_bytes = st.session_state.get("voice_audio_bytes")
+    if not wav_bytes:
+        return False
+
+    r = sr.Recognizer()
+    try:
+        audio_file = io.BytesIO(wav_bytes)
+        with sr.AudioFile(audio_file) as source:
+            audio_data = r.record(source)
+        text = r.recognize_google(audio_data)
+        st.session_state["voice_text"] = text
+        st.session_state["query_text"] = text
+        st.success(f"Transcription: {text}")
+        return True
+    except sr.UnknownValueError:
+        st.error("Could not understand the audio.")
+    except sr.RequestError as e:
+        st.error(f"Speech service error: {e}")
+    except Exception as e:
+        st.error(f"Transcription failed: {e}")
+    return False
 
 # ---------------------------
 # Text-to-Speech (gTTS + in-memory MP3)
@@ -166,8 +218,28 @@ def read_aloud_callback():
     if not text:
         st.warning("No answer to read. Submit a query first.")
         return
+    # If user opted to use local TTS and pyttsx3 is available, speak locally (faster on local machines)
+    if USE_LOCAL_TTS:
+        try:
+            import pyttsx3
+            def _speak_local(tt):
+                try:
+                    engine = pyttsx3.init()
+                    engine.say(tt)
+                    engine.runAndWait()
+                except Exception as e:
+                    st.session_state["last_error_trace"] = traceback.format_exc()
+                    print("Local TTS error:", e)
+            threading.Thread(target=_speak_local, args=(text[:TTS_CHARS_LIMIT],), daemon=True).start()
+            st.session_state["status_message"] = "Playing (local TTS)..."
+            return
+        except Exception as e:
+            st.session_state["last_error_trace"] = traceback.format_exc()
+            print("pyttsx3 not available, falling back to gTTS", e)
+
+    # Otherwise use gTTS -> in-memory mp3. Limit characters to speed up.
     st.session_state["status_message"] = "Generating audio..."
-    audio_bytes = generate_audio_bytes(text)
+    audio_bytes = generate_audio_bytes(text[:TTS_CHARS_LIMIT])
     if audio_bytes:
         st.session_state["audio_bytes"] = audio_bytes
         st.session_state["play_audio"] = True
@@ -184,6 +256,7 @@ def stop_callback():
 def clear_callback():
     st.session_state["query_text"] = ""
     st.session_state["voice_text"] = ""
+    st.session_state["voice_audio_bytes"] = None
     st.session_state["last_answer"] = ""
     st.session_state["play_audio"] = False
     st.session_state["audio_bytes"] = None
@@ -222,6 +295,14 @@ def show_spinner_placeholder():
 # ---------------------------
 
 def submit_query_internal():
+    # If user recorded audio via browser, transcribe it first so voice_text/query_text are set
+    if st.session_state.get("voice_audio_bytes"):
+        try:
+            transcribe_recording_and_set_text()
+        except Exception:
+            st.session_state["last_error_trace"] = traceback.format_exc()
+            print("Transcription error:", st.session_state["last_error_trace"])
+
     typed = st.session_state.get("query_text", "").strip()
     voice = st.session_state.get("voice_text", "").strip()
     query = typed or voice
@@ -256,6 +337,41 @@ def submit_query_internal():
             sample = (answer[:300] + "...") if isinstance(answer, str) and len(answer) > 300 else str(answer)
             st.session_state["status_message"] = f"DEBUG: Answer retrieved in {dur:.2f}s. See debug area."
             print(f"DEBUG: main.answer_query finished in {dur:.2f}s. type={type(answer)}, sample={sample!r}")
+
+            # Auto-read if user enabled it: generate/play audio for a shortened chunk to speed up
+            try:
+                if AUTO_READ:
+                    # If local TTS is preferred and available, use it (faster locally)
+                    if USE_LOCAL_TTS:
+                        try:
+                            import pyttsx3
+                            def _speak_local_auto(tt):
+                                try:
+                                    engine = pyttsx3.init()
+                                    engine.say(tt)
+                                    engine.runAndWait()
+                                except Exception as e:
+                                    st.session_state["last_error_trace"] = traceback.format_exc()
+                                    print("Local TTS error during auto-read:", e)
+                            threading.Thread(target=_speak_local_auto, args=(answer[:TTS_CHARS_LIMIT],), daemon=True).start()
+                            st.session_state["status_message"] = "Auto-reading (local TTS)..."
+                        except Exception:
+                            st.session_state["last_error_trace"] = traceback.format_exc()
+                            print("pyttsx3 not available for auto-read, falling back to gTTS")
+                            audio_bytes = generate_audio_bytes(answer[:TTS_CHARS_LIMIT])
+                            if audio_bytes:
+                                st.session_state["audio_bytes"] = audio_bytes
+                                st.session_state["play_audio"] = True
+                                st.session_state["status_message"] = "Auto-playing..."
+                    else:
+                        audio_bytes = generate_audio_bytes(answer[:TTS_CHARS_LIMIT])
+                        if audio_bytes:
+                            st.session_state["audio_bytes"] = audio_bytes
+                            st.session_state["play_audio"] = True
+                            st.session_state["status_message"] = "Auto-playing..."
+            except Exception:
+                st.session_state["last_error_trace"] = traceback.format_exc()
+                print("Auto-read failed:", st.session_state["last_error_trace"])
     except Exception:
         st.session_state["last_answer"] = ""
         st.session_state["last_error_trace"] = traceback.format_exc()
@@ -376,11 +492,8 @@ with col1:
     st.text_input("Ask a legal question about India:", key="query_text")
 
 with col2:
-    if ENABLE_VOICE:
-        st.button("🎤 Speak", on_click=listen_to_voice)
-    else:
-        st.button("🎤 Speak (disabled)")
-
+    # Always call browser/server listen function; it handles which method is available
+    st.button("🎤 Speak", on_click=listen_to_voice)
     st.button("📨 Submit", on_click=submit_query)
 
 # After the main controls, show answer (so it persists across reruns)
