@@ -10,6 +10,6 @@ SpeechRecognition
 streamlit-lottie
 pyttsx3; platform_system=="Windows"
 google-generativeai
-streamlit-audio-recorder>=0.1.6
+audio-recorder-streamlit==0.0.10
 soundfile>=0.12.1
 SpeechRecognition>=3.8.1
