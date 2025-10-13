@@ -13,6 +13,7 @@ import base64
 import streamlit.components.v1 as components
 from contextlib import contextmanager
 
+
 # optional lottie import
 try:
     from streamlit_lottie import st_lottie
@@ -130,10 +131,44 @@ def listen_to_voice():
     Stores WAV bytes in st.session_state['voice_audio_bytes'] when recording completes.
     """
     # Try browser recorder component
+        # Try browser recorder component (support multiple package names / forks)
+    audio_recorder = None
+    _rec_import_ok = None
+
+    # 1) audio-recorder-streamlit -> module: audio_recorder_streamlit, function: audio_recorder
     try:
-        from streamlit_audio_recorder import audio_recorder
+        from audio_recorder_streamlit import audio_recorder  # pip name: audio-recorder-streamlit
+        _rec_import_ok = "audio_recorder_streamlit"
     except Exception:
-        audio_recorder = None
+        # 2) streamlit-audiorec -> module: st_audiorec, function: st_audiorec
+        try:
+            from st_audiorec import st_audiorec  # pip name: streamlit-audiorec
+            def audio_recorder():
+                return st_audiorec()
+            _rec_import_ok = "st_audiorec (streamlit-audiorec)"
+        except Exception:
+            # 3) streamlit_audio_recorder (other forks)
+            try:
+                from streamlit_audio_recorder import audio_recorder
+                _rec_import_ok = "streamlit_audio_recorder"
+            except Exception:
+                # 4) streamlit_audiorecorder or other common names
+                try:
+                    from streamlit_audiorecorder import audio_recorder
+                    _rec_import_ok = "streamlit_audiorecorder"
+                except Exception:
+                    audio_recorder = None
+                    _rec_import_ok = None
+
+    # Small debug print so you can see in logs what succeeded (deployment logs / terminal)
+    try:
+        if _rec_import_ok:
+            print(f"[DEBUG] Recorder import succeeded: {_rec_import_ok}")
+        else:
+            print("[DEBUG] No browser recorder import succeeded; audio_recorder is None")
+    except Exception:
+        pass
+
 
     if audio_recorder is not None:
         st.markdown("<div class='center-msg'>🎤 Click the record button, speak, then click Stop. Then click 'Submit' to transcribe.</div>", unsafe_allow_html=True)
