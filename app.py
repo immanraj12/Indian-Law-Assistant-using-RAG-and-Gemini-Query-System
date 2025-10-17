@@ -1,5 +1,5 @@
 # app.py
-# Full Streamlit app with main-flow recorder rendering (show_recorder flag)
+# Streamlit app: automatic transcription when recorder returns a capture
 # Keep requirements: streamlit, audio-recorder-streamlit, pydub (recommended), soundfile, SpeechRecognition, gTTS, etc.
 
 import streamlit as st
@@ -308,7 +308,7 @@ def transcribe_recording_and_set_text():
     """
     raw = st.session_state.get("last_rec_payload") or st.session_state.get("voice_audio_bytes")
     if not raw:
-        st.error("No recording found to transcribe. Record first then press 'Process Recording'.")
+        st.error("No recording found to transcribe. Record first then use Speak again.")
         return False
 
     _debug_log("Attempting to extract audio bytes from recorder payload...")
@@ -379,19 +379,6 @@ def transcribe_recording_and_set_text():
 
     st.error("Transcription unsuccessful. Consider installing pydub+ffmpeg on the host for more robust conversion.")
     return False
-
-# ---------------------------
-# Recorder control and process button
-# ---------------------------
-def process_last_recording():
-    if not st.session_state.get("last_rec_payload"):
-        st.warning("No recording found. Record first, then click 'Process Recording'.")
-        return
-    ok = transcribe_recording_and_set_text()
-    if not ok:
-        st.error("Transcription failed. Open Diagnostics for payload preview and last_error_trace.")
-    else:
-        st.success("Transcription finished and placed into the question box.")
 
 # ---------------------------
 # Text-to-Speech (gTTS)
@@ -492,7 +479,7 @@ def submit_query_internal():
     voice = st.session_state.get("voice_text", "").strip()
     query = typed or voice
     if not query:
-        st.session_state["status_message"] = "Please type a question or use the Speak button (and Process Recording) first."
+        st.session_state["status_message"] = "Please type a question or use the Speak button first."
         return
 
     st.session_state["status_message"] = "DEBUG: calling main.answer_query(...) — starting"
@@ -670,11 +657,10 @@ with col2:
     if st.button("🎤 Speak"):
         st.session_state["show_recorder"] = True
 
-    st.button("🛠 Process Recording", on_click=process_last_recording)
     st.button("📨 Submit", on_click=submit_query)
 
 # ---------------------------
-# Render recorder in main flow when requested
+# Render recorder in main flow when requested (auto-transcribe)
 # ---------------------------
 if st.session_state.get("show_recorder"):
     # Try available recorder components
@@ -701,7 +687,7 @@ if st.session_state.get("show_recorder"):
                     audio_recorder = None
                     _rec_import_ok = None
 
-    st.markdown("<div class='center-msg'>🎤 Click record, speak, then Stop. After stopping, click 'Process Recording' to transcribe.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='center-msg'>🎤 Click record, speak, then Stop. The app will auto-transcribe and place text into the question box.</div>", unsafe_allow_html=True)
 
     if audio_recorder is None:
         st.error("No supported audio recorder found. Install audio-recorder-streamlit or similar and add to requirements.")
@@ -709,11 +695,11 @@ if st.session_state.get("show_recorder"):
     else:
         rec = audio_recorder()
         if rec is None:
-            st.info("Recorder active — press Stop in the recorder widget, then click 'Process Recording'.")
+            st.info("Recorder active — press Stop in the recorder widget; transcription will run automatically when recording stops.")
         else:
             # Save only non-empty payload and reset the recorder flag
             st.session_state["last_rec_payload"] = rec
-            st.success("Recording captured — click 'Process Recording' to transcribe.")
+            st.success("Recording captured — transcribing now...")
             st.session_state["show_recorder"] = False
             # optional preview
             try:
@@ -731,6 +717,17 @@ if st.session_state.get("show_recorder"):
                     st.write("Recorder returned object of type:", type(rec))
             except Exception:
                 pass
+
+            # Auto-transcribe immediately
+            try:
+                ok = transcribe_recording_and_set_text()
+                if not ok:
+                    st.error("Automatic transcription failed. See Diagnostics for payload preview and trace.")
+                else:
+                    st.success("Transcription placed into the question box.")
+            except Exception:
+                st.session_state["last_error_trace"] = traceback.format_exc()
+                st.error("Automatic transcription raised an exception (see Diagnostics).")
 
 # After the main controls, show answer (so it persists across reruns)
 show_answer_and_chunks()
