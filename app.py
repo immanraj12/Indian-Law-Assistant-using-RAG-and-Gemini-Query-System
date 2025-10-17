@@ -1,12 +1,8 @@
 # app.py
-# AI Legal Assistant (Streamlit) with voice recording/transcription
-# Designed for requirements:
-#   streamlit, pdfplumber, faiss-cpu, sentence-transformers,
-#   google-generativeai, numpy, requests, gTTS, SpeechRecognition,
-#   streamlit-lottie, pyttsx3 (Windows), audio-recorder-streamlit,
-#   soundfile, soundfile>=0.12.1, SpeechRecognition>=3.8.1
-#
-# If you later add pydub + ffmpeg, audio conversion becomes more robust for webm/mp3.
+# Full Streamlit app (updated) - includes robust recorder handling and a "Process Recording" button
+# Requirements suggested: streamlit, pdfplumber, faiss-cpu, sentence-transformers,
+# google-generativeai, numpy, requests, gTTS, SpeechRecognition, streamlit-lottie,
+# pyttsx3 (Windows), audio-recorder-streamlit==0.0.10, soundfile, pydub (optional)
 
 import streamlit as st
 import os
@@ -24,15 +20,29 @@ import streamlit.components.v1 as components
 from contextlib import contextmanager
 import tempfile
 import re
-import soundfile as sf
-import numpy as np
 
-# optional lottie import
+# optional imports
 try:
     from streamlit_lottie import st_lottie
     LOTTIE = True
 except Exception:
     LOTTIE = False
+
+# pydub optional (for best conversion support)
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except Exception:
+    AudioSegment = None
+    PYDUB_AVAILABLE = False
+
+# soundfile optional fallback
+try:
+    import soundfile as sf
+    SOUND_FILE_AVAILABLE = True
+except Exception:
+    sf = None
+    SOUND_FILE_AVAILABLE = False
 
 # ---------------------------
 # Page Config & Styling
@@ -63,7 +73,7 @@ st.markdown("This tool provides **informational summaries** based on uploaded la
 st.markdown('<p class="disclaimer">❗ Disclaimer: This is informational only. Not legal advice.</p>', unsafe_allow_html=True)
 
 # ---------------------------
-# Load Gemini API Key (optional)
+# Load Gemini API Key
 # ---------------------------
 gemini_key = os.getenv("GEMINI_API_KEY")
 if gemini_key:
@@ -114,8 +124,8 @@ lottie_json = load_lottie_url(LOTTIE_URL) if LOTTIE else None
 # ---------------------------
 st.session_state.setdefault("query_text", "")
 st.session_state.setdefault("voice_text", "")
-st.session_state.setdefault("voice_audio_bytes", None)  # can hold raw bytes or raw recorder payload
-st.session_state.setdefault("last_rec_payload", None)   # raw recorder payload for debugging
+st.session_state.setdefault("voice_audio_bytes", None)   # legacy raw bytes or payload; not used primarily now
+st.session_state.setdefault("last_rec_payload", None)    # raw recorder payload preserved for processing
 st.session_state.setdefault("spinner_counter", 0)
 st.session_state.setdefault("play_audio", False)
 st.session_state.setdefault("audio_bytes", None)
@@ -125,19 +135,8 @@ st.session_state.setdefault("status_message", "")
 st.session_state.setdefault("last_error_trace", "")
 
 # ---------------------------
-# Voice helpers (no pydub) — use soundfile where possible
+# Utilities: debug + base64 extraction
 # ---------------------------
-
-def can_use_microphone() -> bool:
-    """Server-side microphone availability check (only relevant for local dev)."""
-    if not ENABLE_VOICE:
-        return False
-    try:
-        with sr.Microphone() as source:
-            return True
-    except Exception:
-        return False
-
 def _debug_log(msg, print_console=True):
     try:
         st.session_state.setdefault("status_message", "")
@@ -163,7 +162,7 @@ def _try_base64_decode(s: str):
         return None, None
 
 def _extract_bytes_from_rec(rec):
-    """Try to find raw bytes and optional mime from recorder return."""
+    """Return (raw_bytes, mime_or_none) or (None, None)."""
     if isinstance(rec, (bytes, bytearray)):
         return bytes(rec), None
     if isinstance(rec, str):
@@ -189,7 +188,7 @@ def _extract_bytes_from_rec(rec):
                         decoded, mime = _try_base64_decode(c)
                         if decoded:
                             return decoded, mime
-        # deep search for long base64 strings
+        # deep search for base64-like strings
         def _search_for_b64(v):
             if isinstance(v, dict):
                 for vv in v.values():
@@ -226,43 +225,101 @@ def _extract_bytes_from_rec(rec):
         return None, None
     return None, None
 
-def _convert_to_wav_bytes_using_soundfile(raw_bytes: bytes):
-    """Try to read the bytes with soundfile and re-export as WAV bytes.
-       soundfile supports WAV/FLAC/OGG (depending on libsndfile build).
-       MP3 and WebM/Opus may not be supported — in that case this will fail."""
-    try:
-        bio = io.BytesIO(raw_bytes)
-        # soundfile can accept file-like objects in recent versions
-        with sf.SoundFile(bio) as sf_file:
-            data = sf_file.read(dtype='float32')
-            samplerate = sf_file.samplerate
-            # write WAV to buffer
+# ---------------------------
+# Audio conversion helpers (pydub preferred, fallback to soundfile/tempfile attempts)
+# ---------------------------
+def _convert_to_wav_bytes(raw_bytes: bytes, mime: str = None) -> bytes:
+    """Try to convert raw bytes (common web/ogg/mp3/wav) into WAV bytes.
+       Prefer pydub+ffmpeg if available; otherwise attempt soundfile or tempfile fallback.
+    """
+    if not raw_bytes:
+        return None
+    # quick check if already RIFF WAV
+    if raw_bytes[:4] == b"RIFF":
+        return raw_bytes
+    # try pydub if available
+    if PYDUB_AVAILABLE and AudioSegment is not None:
+        fmt = None
+        if mime:
+            try:
+                fmt = mime.split("/")[-1].lower()
+            except Exception:
+                fmt = None
+        header = raw_bytes[:12]
+        if header.startswith(b"\x1a\x45\xdf\xa3"):
+            fmt = fmt or "webm"
+        if header[:3] == b"Ogg":
+            fmt = fmt or "ogg"
+        if raw_bytes[:2] == b"\xff\xfb" or raw_bytes[:3] == b"ID3":
+            fmt = fmt or "mp3"
+        tried = []
+        if fmt:
+            tried.append(fmt)
+        tried.extend([f for f in ("webm", "ogg", "mp3", "wav", "flac") if f not in tried])
+        for f in tried:
+            try:
+                audio = AudioSegment.from_file(io.BytesIO(raw_bytes), format=f)
+                out = io.BytesIO()
+                audio.export(out, format="wav")
+                out.seek(0)
+                return out.read()
+            except Exception as e:
+                _debug_log(f"pydub try failed for format {f}: {e}", print_console=False)
+                continue
+    # try soundfile conversion if available
+    if SOUND_FILE_AVAILABLE and sf is not None:
+        try:
+            bio = io.BytesIO(raw_bytes)
+            with sf.SoundFile(bio) as sf_file:
+                data = sf_file.read(dtype='float32')
+                sr = sf_file.samplerate
             out = io.BytesIO()
-            # soundfile.write expects array-like, samplerate, and file info
-            sf.write(out, data, samplerate, format="WAV", subtype="PCM_16")
+            sf.write(out, data, sr, format="WAV", subtype="PCM_16")
             out.seek(0)
             return out.read()
-    except Exception as e:
-        # might be unsupported format (mp3/webm), return None so caller can try fallbacks
-        _debug_log(f"soundfile conversion failed: {e}", print_console=False)
-        return None
+        except Exception as e:
+            _debug_log(f"soundfile try failed: {e}", print_console=False)
 
+    # fallback attempt: write raw bytes to tempfile with common suffixes and let SpeechRecognition try
+    for ext in (".wav", ".webm", ".ogg", ".mp3", ".flac"):
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+            tmp.write(raw_bytes)
+            tmp.flush()
+            tmp.close()
+            try:
+                # try to open as sr.AudioFile; if success, convert read into wav bytes by reading then exporting (best-effort)
+                r = sr.Recognizer()
+                with sr.AudioFile(tmp.name) as source:
+                    audio_data = r.record(source)
+                # We don't have an in-memory writer from sr to wav; instead just return raw bytes and let sr handle reading later.
+                # But returning None here signals caller to use tempfile fallback path directly.
+                return None
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return None
+
+# ---------------------------
+# Transcription flow
+# ---------------------------
 def transcribe_recording_and_set_text():
-    """Transcribe recorder payload stored in session (either voice_audio_bytes or last_rec_payload)."""
-    raw = st.session_state.get("voice_audio_bytes")
+    """Transcribe the payload stored in st.session_state['last_rec_payload'] (or voice_audio_bytes).
+       Returns True on success, False otherwise.
+    """
+    raw = st.session_state.get("last_rec_payload") or st.session_state.get("voice_audio_bytes")
     if not raw:
-        raw = st.session_state.get("last_rec_payload")
-    if not raw:
-        st.error("No recording found to transcribe.")
+        st.error("No recording found to transcribe. Record first then press 'Process Recording'.")
         return False
 
-    _debug_log("Attempting to extract audio bytes from recorder return...")
+    _debug_log("Attempting to extract audio bytes from recorder payload...")
     raw_bytes, mime = _extract_bytes_from_rec(raw)
     if raw_bytes is None and isinstance(raw, (bytes, bytearray)):
         raw_bytes = bytes(raw)
 
     if raw_bytes is None:
-        st.error("Could not extract audio bytes from the recorder return. See diagnostics for payload preview.")
+        st.error("Could not extract audio bytes from recorder payload. See Diagnostics for payload preview.")
         try:
             st.write("Recorder preview:")
             if isinstance(raw, dict):
@@ -275,61 +332,78 @@ def transcribe_recording_and_set_text():
 
     _debug_log(f"Extracted bytes length={len(raw_bytes)} mime={mime}")
 
-    # Try soundfile conversion -> wav bytes
-    wav_bytes = _convert_to_wav_bytes_using_soundfile(raw_bytes)
-    if not wav_bytes:
-        # fallback: try writing raw bytes to temp with common suffixes and let SpeechRecognition try
+    # Try to convert to WAV bytes
+    wav_bytes = _convert_to_wav_bytes(raw_bytes, mime=mime)
+
+    # If we got wav_bytes, feed to SpeechRecognition from-memory
+    if wav_bytes:
         try:
-            for ext in (".wav", ".ogg", ".flac", ".mp3", ".webm"):
-                try:
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-                    tmp.write(raw_bytes)
-                    tmp.flush()
-                    tmp.close()
-                    r = sr.Recognizer()
-                    with sr.AudioFile(tmp.name) as source:
-                        audio_data = r.record(source)
-                    text = r.recognize_google(audio_data)
-                    st.session_state["voice_text"] = text
-                    st.session_state["query_text"] = text
-                    st.success(f"Transcription: {text}")
-                    return True
-                except Exception:
-                    continue
-        except Exception:
+            audio_file = io.BytesIO(wav_bytes)
+            r = sr.Recognizer()
+            with sr.AudioFile(audio_file) as source:
+                audio_data = r.record(source)
+            text = r.recognize_google(audio_data)
+            st.session_state["voice_text"] = text
+            st.session_state["query_text"] = text
+            st.success(f"Transcription: {text}")
+            return True
+        except sr.UnknownValueError:
+            st.error("Could not understand the audio.")
+        except sr.RequestError as e:
+            st.error(f"Speech service error: {e}")
+        except Exception as e:
             st.session_state["last_error_trace"] = traceback.format_exc()
-            st.error("Fallback transcription attempts failed (see trace).")
+            st.error(f"Transcription (in-memory) failed: {e}")
             return False
 
-    # Transcribe using speech_recognition from in-memory WAV bytes
+    # If conversion to wav_bytes failed or returned None, do tempfile fallback: let SpeechRecognition try file directly
     try:
-        audio_file = io.BytesIO(wav_bytes)
-        r = sr.Recognizer()
-        with sr.AudioFile(audio_file) as source:
-            audio_data = r.record(source)
-        text = r.recognize_google(audio_data)
-        st.session_state["voice_text"] = text
-        st.session_state["query_text"] = text
-        st.success(f"Transcription: {text}")
-        return True
-    except sr.UnknownValueError:
-        st.error("Could not understand the audio.")
-    except sr.RequestError as e:
-        st.error(f"Speech recognition service error: {e}")
-    except Exception as e:
+        for ext in (".wav", ".webm", ".ogg", ".mp3", ".flac"):
+            try:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                tmp.write(raw_bytes)
+                tmp.flush()
+                tmp.close()
+                r = sr.Recognizer()
+                with sr.AudioFile(tmp.name) as source:
+                    audio_data = r.record(source)
+                text = r.recognize_google(audio_data)
+                st.session_state["voice_text"] = text
+                st.session_state["query_text"] = text
+                st.success(f"Transcription: {text}")
+                return True
+            except Exception:
+                continue
+    except Exception:
         st.session_state["last_error_trace"] = traceback.format_exc()
-        st.error(f"Transcription failed: {e}")
+        st.error("Fallback transcription attempts failed (see trace).")
+        return False
+
+    st.error("Transcription unsuccessful. Consider installing pydub+ffmpeg on the host for more robust conversion.")
     return False
 
 # ---------------------------
-# Recorder UI + extraction wrapper
+# Recorder UI + Process button
 # ---------------------------
+def process_last_recording():
+    if not st.session_state.get("last_rec_payload"):
+        st.warning("No recording found. Record first, then click 'Process Recording'.")
+        return
+    ok = transcribe_recording_and_set_text()
+    if not ok:
+        st.error("Transcription failed. Open Diagnostics for payload preview and last_error_trace.")
+    else:
+        st.success("Transcription finished and placed into the question box.")
+
 def listen_to_voice():
-    """Show browser recorder (if installed) and attempt transcription immediately."""
+    """Show the browser recorder widget. Many recorder widgets return None during active recording;
+    we only store and process when the widget returns a non-None payload. The user must click
+    'Process Recording' after stopping the recorder to transcribe.
+    """
     audio_recorder = None
     _rec_import_ok = None
 
-    # try several recorder packages (you have audio-recorder-streamlit in your reqs)
+    # Try a few common recorder components
     try:
         from audio_recorder_streamlit import audio_recorder
         _rec_import_ok = "audio_recorder_streamlit"
@@ -354,15 +428,19 @@ def listen_to_voice():
     _debug_log(f"Recorder import: {_rec_import_ok}")
 
     if audio_recorder is None:
-        st.error("No supported audio recorder component found. Install one (e.g. audio-recorder-streamlit) and add to requirements.")
+        st.error("No supported audio recorder found. Install audio-recorder-streamlit or another recorder and add to requirements.")
         return
 
-    st.markdown("<div class='center-msg'>🎤 Click the record button, speak, then click Stop. Then click 'Submit' to transcribe.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='center-msg'>🎤 Click record, speak, then Stop. After stopping, click 'Process Recording' to transcribe.</div>", unsafe_allow_html=True)
     rec = audio_recorder()
-    # keep raw payload for debugging
-    st.session_state["last_rec_payload"] = rec
 
-    # show quick preview of what recorder returned
+    # If widget still returning None while active, inform user and exit early (do not overwrite last_rec_payload)
+    if rec is None:
+        st.info("Recorder returned None (waiting for user to finish recording). After you Stop the recorder, press 'Process Recording'.")
+        return
+
+    # Save raw payload and show preview
+    st.session_state["last_rec_payload"] = rec
     try:
         if isinstance(rec, (bytes, bytearray)):
             st.write(f"Recorder returned bytes (len={len(rec)})")
@@ -371,7 +449,7 @@ def listen_to_voice():
         elif isinstance(rec, dict):
             st.write("Recorder returned dict keys: " + ", ".join(list(rec.keys())))
             try:
-                st.json({k: (str(v)[:300] + "..." if isinstance(v, (str, bytes)) and len(str(v))>300 else v) for k,v in list(rec.items())[:8]})
+                st.json({k: (str(v)[:300] + "..." if isinstance(v, (str, bytes)) and len(str(v))>300 else v) for k,v in list(rec.items())[:12]})
             except Exception:
                 pass
         else:
@@ -379,15 +457,7 @@ def listen_to_voice():
     except Exception:
         pass
 
-    # Try to extract bytes & transcribe immediately
-    ok = transcribe_recording_and_set_text()
-    if not ok:
-        st.warning("Recording captured but transcription failed. Check Diagnostics / Notes for last_error_trace.")
-    else:
-        # optionally auto-submit
-        AUTO_SUBMIT_AFTER_TRANSCRIBE = False
-        if AUTO_SUBMIT_AFTER_TRANSCRIBE:
-            submit_query_internal()
+    st.success("Recording captured — click 'Process Recording' to transcribe.")
 
 # ---------------------------
 # Text-to-Speech (gTTS)
@@ -454,7 +524,7 @@ def clear_callback():
     st.session_state["last_error_trace"] = ""
 
 # ---------------------------
-# Spinner with Unique Key (context manager)
+# Spinner with Unique Key
 # ---------------------------
 @contextmanager
 def show_spinner_placeholder():
@@ -483,21 +553,13 @@ def show_spinner_placeholder():
 # ---------------------------
 # Submit Query
 # ---------------------------
-
 def submit_query_internal():
-    # If user recorded audio via browser, transcribe it first so voice_text/query_text are set
-    if st.session_state.get("voice_audio_bytes") or st.session_state.get("last_rec_payload"):
-        try:
-            transcribe_recording_and_set_text()
-        except Exception:
-            st.session_state["last_error_trace"] = traceback.format_exc()
-            print("Transcription error:", st.session_state["last_error_trace"])
-
+    # If user recorded audio and already processed, voice_text/query_text will be set
     typed = st.session_state.get("query_text", "").strip()
     voice = st.session_state.get("voice_text", "").strip()
     query = typed or voice
     if not query:
-        st.session_state["status_message"] = "Please type a question or use the Speak button first."
+        st.session_state["status_message"] = "Please type a question or use the Speak button (and Process Recording) first."
         return
 
     st.session_state["status_message"] = "DEBUG: calling main.answer_query(...) — starting"
@@ -573,9 +635,8 @@ def submit_query():
     submit_query_internal()
 
 # ---------------------------
-# Show answer and chunks
+# Show answer and retrieved chunks
 # ---------------------------
-
 def show_answer_and_chunks():
     status = st.session_state.get("status_message", "")
     if status:
@@ -673,13 +734,14 @@ with col1:
 
 with col2:
     st.button("🎤 Speak", on_click=listen_to_voice)
+    st.button("🛠 Process Recording", on_click=process_last_recording)
     st.button("📨 Submit", on_click=submit_query)
 
 # After the main controls, show answer (so it persists across reruns)
 show_answer_and_chunks()
 
 # ---------------------------
-# Audio Control Buttons
+# Audio Control Buttons (use callbacks to modify state inside callbacks)
 # ---------------------------
 if st.session_state.get("last_answer"):
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -695,11 +757,11 @@ if st.session_state.get("last_answer"):
 # ---------------------------
 with st.expander("⚙️ Diagnostics / Notes", expanded=False):
     st.write("Voice enabled:", ENABLE_VOICE)
-    st.write("Microphone available:", can_use_microphone() if ENABLE_VOICE else "N/A")
+    st.write("pydub available:", PYDUB_AVAILABLE)
+    st.write("soundfile available:", SOUND_FILE_AVAILABLE)
     st.write("Gemini key present:", bool(gemini_key))
     st.write("Use Gemini:", USE_GEMINI)
     st.write("Status message:", st.session_state.get("status_message", ""))
-    st.write("soundfile available:", True)
     if st.session_state.get("last_rec_payload") is not None:
         st.write("Last recorder payload preview:")
         try:
