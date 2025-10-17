@@ -344,7 +344,7 @@ def transcribe_recording_and_set_text():
             st.session_state["voice_text"] = text
             st.success(f"Transcription: {text}")
 # Trigger a rerun so the text_input is recreated with voice_text as its value.
-            st.experimental_rerun()
+            st.rerun()
 # (No need to return; the rerun will restart the script.)
             return True
         except sr.UnknownValueError:
