@@ -342,8 +342,10 @@ def transcribe_recording_and_set_text():
                 audio_data = r.record(source)
             text = r.recognize_google(audio_data)
             st.session_state["voice_text"] = text
-            st.session_state["query_text"] = text
             st.success(f"Transcription: {text}")
+# Trigger a rerun so the text_input is recreated with voice_text as its value.
+            st.experimental_rerun()
+# (No need to return; the rerun will restart the script.)
             return True
         except sr.UnknownValueError:
             st.error("Could not understand the audio.")
@@ -650,7 +652,10 @@ def show_answer_and_chunks():
 # ---------------------------
 col1, col2 = st.columns([4, 1])
 with col1:
-    st.text_input("Ask a legal question about India:", key="query_text")
+    # Populate the text input from voice_text (if present) so we can programmatically set it.
+    default_q = st.session_state.get("voice_text", st.session_state.get("query_text", ""))
+    st.text_input("Ask a legal question about India:", key="query_text", value=default_q)
+
 
 with col2:
     # clicking this sets a flag; the recorder widget is rendered below in main flow when flag is true
