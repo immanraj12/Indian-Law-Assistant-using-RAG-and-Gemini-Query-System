@@ -1,8 +1,6 @@
 # app.py
-# Full Streamlit app (updated) - includes robust recorder handling and a "Process Recording" button
-# Requirements suggested: streamlit, pdfplumber, faiss-cpu, sentence-transformers,
-# google-generativeai, numpy, requests, gTTS, SpeechRecognition, streamlit-lottie,
-# pyttsx3 (Windows), audio-recorder-streamlit==0.0.10, soundfile, pydub (optional)
+# Full Streamlit app with main-flow recorder rendering (show_recorder flag)
+# Keep requirements: streamlit, audio-recorder-streamlit, pydub (recommended), soundfile, SpeechRecognition, gTTS, etc.
 
 import streamlit as st
 import os
@@ -124,7 +122,7 @@ lottie_json = load_lottie_url(LOTTIE_URL) if LOTTIE else None
 # ---------------------------
 st.session_state.setdefault("query_text", "")
 st.session_state.setdefault("voice_text", "")
-st.session_state.setdefault("voice_audio_bytes", None)   # legacy raw bytes or payload; not used primarily now
+st.session_state.setdefault("voice_audio_bytes", None)   # legacy raw bytes or payload
 st.session_state.setdefault("last_rec_payload", None)    # raw recorder payload preserved for processing
 st.session_state.setdefault("spinner_counter", 0)
 st.session_state.setdefault("play_audio", False)
@@ -133,6 +131,7 @@ st.session_state.setdefault("tts_thread", None)
 st.session_state.setdefault("last_answer", "")
 st.session_state.setdefault("status_message", "")
 st.session_state.setdefault("last_error_trace", "")
+st.session_state.setdefault("show_recorder", False)      # flag to render recorder in main flow
 
 # ---------------------------
 # Utilities: debug + base64 extraction
@@ -292,8 +291,7 @@ def _convert_to_wav_bytes(raw_bytes: bytes, mime: str = None) -> bytes:
                 r = sr.Recognizer()
                 with sr.AudioFile(tmp.name) as source:
                     audio_data = r.record(source)
-                # We don't have an in-memory writer from sr to wav; instead just return raw bytes and let sr handle reading later.
-                # But returning None here signals caller to use tempfile fallback path directly.
+                # Returning None signals caller to use tempfile fallback
                 return None
             except Exception:
                 continue
@@ -383,7 +381,7 @@ def transcribe_recording_and_set_text():
     return False
 
 # ---------------------------
-# Recorder UI + Process button
+# Recorder control and process button
 # ---------------------------
 def process_last_recording():
     if not st.session_state.get("last_rec_payload"):
@@ -394,70 +392,6 @@ def process_last_recording():
         st.error("Transcription failed. Open Diagnostics for payload preview and last_error_trace.")
     else:
         st.success("Transcription finished and placed into the question box.")
-
-def listen_to_voice():
-    """Show the browser recorder widget. Many recorder widgets return None during active recording;
-    we only store and process when the widget returns a non-None payload. The user must click
-    'Process Recording' after stopping the recorder to transcribe.
-    """
-    audio_recorder = None
-    _rec_import_ok = None
-
-    # Try a few common recorder components
-    try:
-        from audio_recorder_streamlit import audio_recorder
-        _rec_import_ok = "audio_recorder_streamlit"
-    except Exception:
-        try:
-            from st_audiorec import st_audiorec
-            def audio_recorder():
-                return st_audiorec()
-            _rec_import_ok = "st_audiorec (streamlit-audiorec)"
-        except Exception:
-            try:
-                from streamlit_audio_recorder import audio_recorder
-                _rec_import_ok = "streamlit_audio_recorder"
-            except Exception:
-                try:
-                    from streamlit_audiorecorder import audio_recorder
-                    _rec_import_ok = "streamlit_audiorecorder"
-                except Exception:
-                    audio_recorder = None
-                    _rec_import_ok = None
-
-    _debug_log(f"Recorder import: {_rec_import_ok}")
-
-    if audio_recorder is None:
-        st.error("No supported audio recorder found. Install audio-recorder-streamlit or another recorder and add to requirements.")
-        return
-
-    st.markdown("<div class='center-msg'>🎤 Click record, speak, then Stop. After stopping, click 'Process Recording' to transcribe.</div>", unsafe_allow_html=True)
-    rec = audio_recorder()
-
-    # If widget still returning None while active, inform user and exit early (do not overwrite last_rec_payload)
-    if rec is None:
-        st.info("Recorder returned None (waiting for user to finish recording). After you Stop the recorder, press 'Process Recording'.")
-        return
-
-    # Save raw payload and show preview
-    st.session_state["last_rec_payload"] = rec
-    try:
-        if isinstance(rec, (bytes, bytearray)):
-            st.write(f"Recorder returned bytes (len={len(rec)})")
-        elif isinstance(rec, str):
-            st.write(f"Recorder returned string (len={len(rec)}): {rec[:160]}...")
-        elif isinstance(rec, dict):
-            st.write("Recorder returned dict keys: " + ", ".join(list(rec.keys())))
-            try:
-                st.json({k: (str(v)[:300] + "..." if isinstance(v, (str, bytes)) and len(str(v))>300 else v) for k,v in list(rec.items())[:12]})
-            except Exception:
-                pass
-        else:
-            st.write("Recorder returned object of type:", type(rec))
-    except Exception:
-        pass
-
-    st.success("Recording captured — click 'Process Recording' to transcribe.")
 
 # ---------------------------
 # Text-to-Speech (gTTS)
@@ -554,7 +488,6 @@ def show_spinner_placeholder():
 # Submit Query
 # ---------------------------
 def submit_query_internal():
-    # If user recorded audio and already processed, voice_text/query_text will be set
     typed = st.session_state.get("query_text", "").strip()
     voice = st.session_state.get("voice_text", "").strip()
     query = typed or voice
@@ -726,16 +659,78 @@ def show_answer_and_chunks():
             st.error("An unexpected error occurred while showing chunks; see last error trace.")
 
 # ---------------------------
-# UI Controls
+# UI Controls (main layout)
 # ---------------------------
 col1, col2 = st.columns([4, 1])
 with col1:
     st.text_input("Ask a legal question about India:", key="query_text")
 
 with col2:
-    st.button("🎤 Speak", on_click=listen_to_voice)
+    # clicking this sets a flag; the recorder widget is rendered below in main flow when flag is true
+    if st.button("🎤 Speak"):
+        st.session_state["show_recorder"] = True
+
     st.button("🛠 Process Recording", on_click=process_last_recording)
     st.button("📨 Submit", on_click=submit_query)
+
+# ---------------------------
+# Render recorder in main flow when requested
+# ---------------------------
+if st.session_state.get("show_recorder"):
+    # Try available recorder components
+    audio_recorder = None
+    _rec_import_ok = None
+    try:
+        from audio_recorder_streamlit import audio_recorder
+        _rec_import_ok = "audio_recorder_streamlit"
+    except Exception:
+        try:
+            from st_audiorec import st_audiorec
+            def audio_recorder():
+                return st_audiorec()
+            _rec_import_ok = "st_audiorec (streamlit-audiorec)"
+        except Exception:
+            try:
+                from streamlit_audio_recorder import audio_recorder
+                _rec_import_ok = "streamlit_audio_recorder"
+            except Exception:
+                try:
+                    from streamlit_audiorecorder import audio_recorder
+                    _rec_import_ok = "streamlit_audiorecorder"
+                except Exception:
+                    audio_recorder = None
+                    _rec_import_ok = None
+
+    st.markdown("<div class='center-msg'>🎤 Click record, speak, then Stop. After stopping, click 'Process Recording' to transcribe.</div>", unsafe_allow_html=True)
+
+    if audio_recorder is None:
+        st.error("No supported audio recorder found. Install audio-recorder-streamlit or similar and add to requirements.")
+        st.session_state["show_recorder"] = False
+    else:
+        rec = audio_recorder()
+        if rec is None:
+            st.info("Recorder active — press Stop in the recorder widget, then click 'Process Recording'.")
+        else:
+            # Save only non-empty payload and reset the recorder flag
+            st.session_state["last_rec_payload"] = rec
+            st.success("Recording captured — click 'Process Recording' to transcribe.")
+            st.session_state["show_recorder"] = False
+            # optional preview
+            try:
+                if isinstance(rec, (bytes, bytearray)):
+                    st.write(f"Recorder returned bytes (len={len(rec)})")
+                elif isinstance(rec, str):
+                    st.write(f"Recorder returned string (len={len(rec)}): {rec[:180]}...")
+                elif isinstance(rec, dict):
+                    st.write("Recorder returned dict keys: " + ", ".join(list(rec.keys())))
+                    try:
+                        st.json({k: (str(v)[:300] + "..." if isinstance(v, (str, bytes)) and len(str(v))>300 else v) for k,v in list(rec.items())[:12]})
+                    except Exception:
+                        pass
+                else:
+                    st.write("Recorder returned object of type:", type(rec))
+            except Exception:
+                pass
 
 # After the main controls, show answer (so it persists across reruns)
 show_answer_and_chunks()
@@ -769,7 +764,7 @@ with st.expander("⚙️ Diagnostics / Notes", expanded=False):
             if isinstance(rec, dict):
                 st.json({k: (str(v)[:300] + "..." if isinstance(v, (str, bytes)) and len(str(v))>300 else v) for k,v in list(rec.items())[:12]})
             else:
-                st.write(str(rec)[:1000])
+                st.write(str(rec)[:2000])
         except Exception:
             st.write("Could not preview recorder payload.")
     if st.session_state.get("last_error_trace"):
