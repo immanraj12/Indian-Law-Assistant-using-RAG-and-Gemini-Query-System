@@ -1,3 +1,13 @@
+# app.py
+# AI Legal Assistant (Streamlit) with voice recording/transcription
+# Designed for requirements:
+#   streamlit, pdfplumber, faiss-cpu, sentence-transformers,
+#   google-generativeai, numpy, requests, gTTS, SpeechRecognition,
+#   streamlit-lottie, pyttsx3 (Windows), audio-recorder-streamlit,
+#   soundfile, soundfile>=0.12.1, SpeechRecognition>=3.8.1
+#
+# If you later add pydub + ffmpeg, audio conversion becomes more robust for webm/mp3.
+
 import streamlit as st
 import os
 import main
@@ -12,6 +22,10 @@ import traceback
 import base64
 import streamlit.components.v1 as components
 from contextlib import contextmanager
+import tempfile
+import re
+import soundfile as sf
+import numpy as np
 
 # optional lottie import
 try:
@@ -49,11 +63,10 @@ st.markdown("This tool provides **informational summaries** based on uploaded la
 st.markdown('<p class="disclaimer">❗ Disclaimer: This is informational only. Not legal advice.</p>', unsafe_allow_html=True)
 
 # ---------------------------
-# Load Gemini API Key
+# Load Gemini API Key (optional)
 # ---------------------------
 gemini_key = os.getenv("GEMINI_API_KEY")
 if gemini_key:
-    # sanitize accidental surrounding quotes
     gemini_key = gemini_key.strip().strip('"').strip("'")
     os.environ["GEMINI_API_KEY"] = gemini_key
     os.environ["GOOGLE_API_KEY"] = gemini_key
@@ -84,7 +97,6 @@ READ_FULL_TTS = st.sidebar.checkbox("Read full TTS (may be slow for long answers
 # ---------------------------
 # Lottie Loader
 # ---------------------------
-
 def load_lottie_url(url: str):
     try:
         r = requests.get(url, timeout=5)
@@ -102,7 +114,8 @@ lottie_json = load_lottie_url(LOTTIE_URL) if LOTTIE else None
 # ---------------------------
 st.session_state.setdefault("query_text", "")
 st.session_state.setdefault("voice_text", "")
-st.session_state.setdefault("voice_audio_bytes", None)
+st.session_state.setdefault("voice_audio_bytes", None)  # can hold raw bytes or raw recorder payload
+st.session_state.setdefault("last_rec_payload", None)   # raw recorder payload for debugging
 st.session_state.setdefault("spinner_counter", 0)
 st.session_state.setdefault("play_audio", False)
 st.session_state.setdefault("audio_bytes", None)
@@ -112,7 +125,7 @@ st.session_state.setdefault("status_message", "")
 st.session_state.setdefault("last_error_trace", "")
 
 # ---------------------------
-# Voice Recognition (browser-first)
+# Voice helpers (no pydub) — use soundfile where possible
 # ---------------------------
 
 def can_use_microphone() -> bool:
@@ -125,214 +138,173 @@ def can_use_microphone() -> bool:
     except Exception:
         return False
 
-
-def listen_to_voice():
-    """Browser recorder first (works on Streamlit Cloud). Falls back to server mic only for local dev.
-    Stores WAV bytes in st.session_state['voice_audio_bytes'] when recording completes.
-    """
-    # Try browser recorder component (we expect one of several module names)
-    audio_recorder = None
-    _rec_import_ok = None
-
-    # 1) audio-recorder-streamlit -> module: audio_recorder_streamlit, function: audio_recorder
+def _debug_log(msg, print_console=True):
     try:
-        from audio_recorder_streamlit import audio_recorder  # pip name: audio-recorder-streamlit
-        _rec_import_ok = "audio_recorder_streamlit"
-    except Exception:
-        # 2) streamlit-audiorec -> module: st_audiorec, function: st_audiorec
-        try:
-            from st_audiorec import st_audiorec  # pip name: streamlit-audiorec
-            def audio_recorder():
-                return st_audiorec()
-            _rec_import_ok = "st_audiorec (streamlit-audiorec)"
-        except Exception:
-            # 3) streamlit_audio_recorder (other forks)
-            try:
-                from streamlit_audio_recorder import audio_recorder
-                _rec_import_ok = "streamlit_audio_recorder"
-            except Exception:
-                # 4) streamlit_audiorecorder or other possible names
-                try:
-                    from streamlit_audiorecorder import audio_recorder
-                    _rec_import_ok = "streamlit_audiorecorder"
-                except Exception:
-                    audio_recorder = None
-                    _rec_import_ok = None
-
-    # Small debug print so you can see in logs what succeeded (deployment logs / terminal)
-    try:
-        if _rec_import_ok:
-            print(f"[DEBUG] Recorder import succeeded: {_rec_import_ok}")
-        else:
-            print("[DEBUG] No browser recorder import succeeded; audio_recorder is None")
+        st.session_state.setdefault("status_message", "")
+        st.session_state["status_message"] = msg
     except Exception:
         pass
+    if print_console:
+        print("[VOICE DEBUG]", msg)
 
-    if audio_recorder is not None:
-        st.markdown("<div class='center-msg'>🎤 Click the record button, speak, then click Stop. Then click 'Submit' to transcribe.</div>", unsafe_allow_html=True)
-        rec = audio_recorder()  # could be: bytes, base64-string, dict, list, tuple, or None
-        # debug-log the returned type/shape so we can diagnose in deployment logs
+def _try_base64_decode(s: str):
+    s = s.strip()
+    m = re.match(r"data:audio/([^;]+);base64,(.*)$", s, flags=re.I | re.S)
+    if m:
+        mime = "audio/" + m.group(1).lower()
+        b64_payload = m.group(2)
         try:
-            if isinstance(rec, (bytes, bytearray)):
-                print("[DEBUG] recorder returned bytes (len=%d)" % len(rec))
-            elif isinstance(rec, str):
-                print("[DEBUG] recorder returned str (len=%d) (preview=%s)" % (len(rec), rec[:60].replace("\n"," ")))
-            elif isinstance(rec, dict):
-                print("[DEBUG] recorder returned dict keys: %s" % (", ".join(rec.keys())))
-            elif isinstance(rec, (list, tuple)):
-                print("[DEBUG] recorder returned list/tuple of length %d" % len(rec))
-            else:
-                print("[DEBUG] recorder returned object type:", type(rec))
+            return base64.b64decode(b64_payload), mime
         except Exception:
-            pass
-
-        if not rec:
-            # user cancelled or no data
-            st.info("No recording captured (cancelled or empty).")
-            return
-
-        wav_bytes = None
-
-        # 1) If bytes --> assume WAV/PCM bytes ready for SpeechRecognition
-        if isinstance(rec, (bytes, bytearray)):
-            wav_bytes = bytes(rec)
-        # 2) If base64-encoded string (common) --> decode
-        elif isinstance(rec, str):
-            import base64 as _b64, re as _re
-            s = rec.strip()
-            # remove data uri prefix if exists
-            data_prefix = _re.match(r"data:audio/[^;]+;base64,(.*)$", s, flags=_re.I)
-            if data_prefix:
-                s = data_prefix.group(1)
-            try:
-                wav_bytes = _b64.b64decode(s)
-            except Exception as e:
-                print("[DEBUG] base64 decode failed:", e)
-                wav_bytes = None
-        # 3) If dict, try common keys
-        elif isinstance(rec, dict):
-            # common keys: 'audio', 'data', 'wav', 'blob', 'audio_base64'
-            for k in ("audio", "data", "wav", "blob", "audio_base64", "base64"):
-                if k in rec and rec[k]:
-                    val = rec[k]
-                    if isinstance(val, (bytes, bytearray)):
-                        wav_bytes = bytes(val)
-                    elif isinstance(val, str):
-                        import base64 as _b64
-                        try:
-                            wav_bytes = _b64.b64decode(val)
-                        except Exception:
-                            # sometimes value is a data URI
-                            import re as _re
-                            m = _re.match(r"data:audio/[^;]+;base64,(.*)$", val, flags=_re.I)
-                            if m:
-                                try:
-                                    wav_bytes = _b64.b64decode(m.group(1))
-                                except Exception:
-                                    wav_bytes = None
-                    if wav_bytes:
-                        break
-            # sometimes dict contains multipart parts (e.g., { "file": { "content": "<base64>" } })
-            if not wav_bytes:
-                # deep search for any base64-like string value
-                import base64 as _b64, re as _re
-                def _search_for_b64(d):
-                    if isinstance(d, dict):
-                        for vv in d.values():
-                            res = _search_for_b64(vv)
-                            if res:
-                                return res
-                    elif isinstance(d, (list, tuple)):
-                        for vv in d:
-                            res = _search_for_b64(vv)
-                            if res:
-                                return res
-                    elif isinstance(d, str):
-                        s = d.strip()
-                        if len(s) > 100:  # heuristic for base64 payload length
-                            # strip data: prefix then attempt decode
-                            m = _re.match(r"data:audio/[^;]+;base64,(.*)$", s, flags=_re.I)
-                            if m:
-                                s = m.group(1)
-                            try:
-                                return _b64.b64decode(s)
-                            except Exception:
-                                return None
-                    return None
-                wav_bytes = _search_for_b64(rec)
-        # 4) If list/tuple, try to find bytes or base64 inside
-        elif isinstance(rec, (list, tuple)):
-            for item in rec:
-                if isinstance(item, (bytes, bytearray)):
-                    wav_bytes = bytes(item)
-                    break
-                if isinstance(item, str):
-                    import base64 as _b64, re as _re
-                    s = item.strip()
-                    m = _re.match(r"data:audio/[^;]+;base64,(.*)$", s, flags=_re.I)
-                    if m:
-                        s = m.group(1)
-                    try:
-                        wav_bytes = _b64.b64decode(s)
-                        break
-                    except Exception:
-                        continue
-
-        # If we have wav_bytes, store and transcribe
-        if wav_bytes:
-            st.session_state["voice_audio_bytes"] = wav_bytes
-            st.success("✅ Recording captured. Transcribing now...")
-            # attempt immediate transcription and set the text box
-            ok = transcribe_recording_and_set_text()
-            if not ok:
-                st.warning("Recording captured but transcription failed. Click Submit to try again.")
-            else:
-                # optionally auto-submit the query after transcription:
-                # set to True if you want the app to run the query automatically after transcription
-                AUTO_SUBMIT_AFTER_TRANSCRIBE = False
-                if AUTO_SUBMIT_AFTER_TRANSCRIBE:
-                    submit_query_internal()
-            return
-        else:
-            st.error("Recording captured, but returned audio format was not understood by the server. Check deployment logs for details.")
-            return
-
-    # Fallback to server-side mic (only works locally if pyaudio is installed)
-    if not can_use_microphone():
-        st.error("Microphone not available or voice features are disabled. For cloud deployments use the browser recorder (enable the browser recorder package in requirements).")
-        return
-
-    r = sr.Recognizer()
+            return None, mime
     try:
-        with sr.Microphone() as source:
-            st.markdown("<div class='center-msg'>🎤 Listening... Speak now! (will stop after 8s)</div>", unsafe_allow_html=True)
-            audio = r.listen(source, phrase_time_limit=8)
+        return base64.b64decode(s), None
+    except Exception:
+        return None, None
+
+def _extract_bytes_from_rec(rec):
+    """Try to find raw bytes and optional mime from recorder return."""
+    if isinstance(rec, (bytes, bytearray)):
+        return bytes(rec), None
+    if isinstance(rec, str):
+        decoded, mime = _try_base64_decode(rec)
+        if decoded:
+            return decoded, mime
+        return None, None
+    if isinstance(rec, dict):
+        for k in ("audio", "data", "wav", "blob", "audio_base64", "base64", "file", "recording"):
+            if k in rec and rec[k]:
+                val = rec[k]
+                if isinstance(val, (bytes, bytearray)):
+                    return bytes(val), rec.get("mimeType") or rec.get("type") or None
+                if isinstance(val, str):
+                    decoded, mime = _try_base64_decode(val)
+                    if decoded:
+                        return decoded, mime
+                if isinstance(val, dict) and "content" in val:
+                    c = val["content"]
+                    if isinstance(c, (bytes, bytearray)):
+                        return bytes(c), val.get("mimeType") or None
+                    if isinstance(c, str):
+                        decoded, mime = _try_base64_decode(c)
+                        if decoded:
+                            return decoded, mime
+        # deep search for long base64 strings
+        def _search_for_b64(v):
+            if isinstance(v, dict):
+                for vv in v.values():
+                    out = _search_for_b64(vv)
+                    if out:
+                        return out
+            elif isinstance(v, (list, tuple)):
+                for vv in v:
+                    out = _search_for_b64(vv)
+                    if out:
+                        return out
+            elif isinstance(v, str):
+                if len(v) > 100:
+                    decoded, mime = _try_base64_decode(v)
+                    if decoded:
+                        return decoded, mime
+            return None
+        res = _search_for_b64(rec)
+        if res:
+            return res
+        return None, None
+    if isinstance(rec, (list, tuple)):
+        for item in rec:
+            if isinstance(item, (bytes, bytearray)):
+                return bytes(item), None
+            if isinstance(item, str):
+                decoded, mime = _try_base64_decode(item)
+                if decoded:
+                    return decoded, mime
+            if isinstance(item, dict):
+                out = _extract_bytes_from_rec(item)
+                if out and out[0]:
+                    return out
+        return None, None
+    return None, None
+
+def _convert_to_wav_bytes_using_soundfile(raw_bytes: bytes):
+    """Try to read the bytes with soundfile and re-export as WAV bytes.
+       soundfile supports WAV/FLAC/OGG (depending on libsndfile build).
+       MP3 and WebM/Opus may not be supported — in that case this will fail."""
+    try:
+        bio = io.BytesIO(raw_bytes)
+        # soundfile can accept file-like objects in recent versions
+        with sf.SoundFile(bio) as sf_file:
+            data = sf_file.read(dtype='float32')
+            samplerate = sf_file.samplerate
+            # write WAV to buffer
+            out = io.BytesIO()
+            # soundfile.write expects array-like, samplerate, and file info
+            sf.write(out, data, samplerate, format="WAV", subtype="PCM_16")
+            out.seek(0)
+            return out.read()
     except Exception as e:
-        st.error(f"Microphone error: {e}")
-        return
-
-    try:
-        text = r.recognize_google(audio)
-        st.session_state["voice_text"] = text
-        st.session_state["query_text"] = text
-        st.markdown("<div class='center-msg'>✅ Voice captured. Text was placed into the question box.</div>", unsafe_allow_html=True)
-    except sr.UnknownValueError:
-        st.error("❌ Could not understand audio.")
-    except sr.RequestError:
-        st.error("❌ Speech recognition service unavailable.")
-
+        # might be unsupported format (mp3/webm), return None so caller can try fallbacks
+        _debug_log(f"soundfile conversion failed: {e}", print_console=False)
+        return None
 
 def transcribe_recording_and_set_text():
-    """Transcribe WAV bytes from st.session_state['voice_audio_bytes'] using SpeechRecognition.
-    Sets voice_text and query_text on success. Returns True if transcription succeeded.
-    """
-    wav_bytes = st.session_state.get("voice_audio_bytes")
-    if not wav_bytes:
+    """Transcribe recorder payload stored in session (either voice_audio_bytes or last_rec_payload)."""
+    raw = st.session_state.get("voice_audio_bytes")
+    if not raw:
+        raw = st.session_state.get("last_rec_payload")
+    if not raw:
+        st.error("No recording found to transcribe.")
         return False
 
-    r = sr.Recognizer()
+    _debug_log("Attempting to extract audio bytes from recorder return...")
+    raw_bytes, mime = _extract_bytes_from_rec(raw)
+    if raw_bytes is None and isinstance(raw, (bytes, bytearray)):
+        raw_bytes = bytes(raw)
+
+    if raw_bytes is None:
+        st.error("Could not extract audio bytes from the recorder return. See diagnostics for payload preview.")
+        try:
+            st.write("Recorder preview:")
+            if isinstance(raw, dict):
+                st.json(raw)
+            else:
+                st.write(str(raw)[:2000])
+        except Exception:
+            pass
+        return False
+
+    _debug_log(f"Extracted bytes length={len(raw_bytes)} mime={mime}")
+
+    # Try soundfile conversion -> wav bytes
+    wav_bytes = _convert_to_wav_bytes_using_soundfile(raw_bytes)
+    if not wav_bytes:
+        # fallback: try writing raw bytes to temp with common suffixes and let SpeechRecognition try
+        try:
+            for ext in (".wav", ".ogg", ".flac", ".mp3", ".webm"):
+                try:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+                    tmp.write(raw_bytes)
+                    tmp.flush()
+                    tmp.close()
+                    r = sr.Recognizer()
+                    with sr.AudioFile(tmp.name) as source:
+                        audio_data = r.record(source)
+                    text = r.recognize_google(audio_data)
+                    st.session_state["voice_text"] = text
+                    st.session_state["query_text"] = text
+                    st.success(f"Transcription: {text}")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            st.session_state["last_error_trace"] = traceback.format_exc()
+            st.error("Fallback transcription attempts failed (see trace).")
+            return False
+
+    # Transcribe using speech_recognition from in-memory WAV bytes
     try:
         audio_file = io.BytesIO(wav_bytes)
+        r = sr.Recognizer()
         with sr.AudioFile(audio_file) as source:
             audio_data = r.record(source)
         text = r.recognize_google(audio_data)
@@ -343,17 +315,84 @@ def transcribe_recording_and_set_text():
     except sr.UnknownValueError:
         st.error("Could not understand the audio.")
     except sr.RequestError as e:
-        st.error(f"Speech service error: {e}")
+        st.error(f"Speech recognition service error: {e}")
     except Exception as e:
+        st.session_state["last_error_trace"] = traceback.format_exc()
         st.error(f"Transcription failed: {e}")
     return False
 
 # ---------------------------
-# Text-to-Speech (gTTS + in-memory MP3)
+# Recorder UI + extraction wrapper
 # ---------------------------
+def listen_to_voice():
+    """Show browser recorder (if installed) and attempt transcription immediately."""
+    audio_recorder = None
+    _rec_import_ok = None
 
+    # try several recorder packages (you have audio-recorder-streamlit in your reqs)
+    try:
+        from audio_recorder_streamlit import audio_recorder
+        _rec_import_ok = "audio_recorder_streamlit"
+    except Exception:
+        try:
+            from st_audiorec import st_audiorec
+            def audio_recorder():
+                return st_audiorec()
+            _rec_import_ok = "st_audiorec (streamlit-audiorec)"
+        except Exception:
+            try:
+                from streamlit_audio_recorder import audio_recorder
+                _rec_import_ok = "streamlit_audio_recorder"
+            except Exception:
+                try:
+                    from streamlit_audiorecorder import audio_recorder
+                    _rec_import_ok = "streamlit_audiorecorder"
+                except Exception:
+                    audio_recorder = None
+                    _rec_import_ok = None
+
+    _debug_log(f"Recorder import: {_rec_import_ok}")
+
+    if audio_recorder is None:
+        st.error("No supported audio recorder component found. Install one (e.g. audio-recorder-streamlit) and add to requirements.")
+        return
+
+    st.markdown("<div class='center-msg'>🎤 Click the record button, speak, then click Stop. Then click 'Submit' to transcribe.</div>", unsafe_allow_html=True)
+    rec = audio_recorder()
+    # keep raw payload for debugging
+    st.session_state["last_rec_payload"] = rec
+
+    # show quick preview of what recorder returned
+    try:
+        if isinstance(rec, (bytes, bytearray)):
+            st.write(f"Recorder returned bytes (len={len(rec)})")
+        elif isinstance(rec, str):
+            st.write(f"Recorder returned string (len={len(rec)}): {rec[:160]}...")
+        elif isinstance(rec, dict):
+            st.write("Recorder returned dict keys: " + ", ".join(list(rec.keys())))
+            try:
+                st.json({k: (str(v)[:300] + "..." if isinstance(v, (str, bytes)) and len(str(v))>300 else v) for k,v in list(rec.items())[:8]})
+            except Exception:
+                pass
+        else:
+            st.write("Recorder returned object of type:", type(rec))
+    except Exception:
+        pass
+
+    # Try to extract bytes & transcribe immediately
+    ok = transcribe_recording_and_set_text()
+    if not ok:
+        st.warning("Recording captured but transcription failed. Check Diagnostics / Notes for last_error_trace.")
+    else:
+        # optionally auto-submit
+        AUTO_SUBMIT_AFTER_TRANSCRIBE = False
+        if AUTO_SUBMIT_AFTER_TRANSCRIBE:
+            submit_query_internal()
+
+# ---------------------------
+# Text-to-Speech (gTTS)
+# ---------------------------
 def generate_audio_bytes(text: str, lang: str = "en") -> bytes:
-    """Generate MP3 bytes using gTTS. Requires internet access."""
     try:
         tts = gTTS(text=text, lang=lang)
         buf = io.BytesIO()
@@ -365,23 +404,14 @@ def generate_audio_bytes(text: str, lang: str = "en") -> bytes:
         st.error(f"gTTS generation failed: {e}")
         return None
 
-
 def read_aloud_callback():
     text = st.session_state.get("last_answer", "")
     if not text:
         st.warning("No answer to read. Submit a query first.")
         return
-
-    # Ensure string form
     text = str(text)
+    tts_text = text if READ_FULL_TTS else text[:TTS_CHARS_LIMIT]
 
-    # Decide whether to read full answer or slice
-    if READ_FULL_TTS:
-        tts_text = text
-    else:
-        tts_text = text[:TTS_CHARS_LIMIT]
-
-    # If user opted to use local TTS and pyttsx3 is available, speak locally (faster on local machines)
     if USE_LOCAL_TTS:
         try:
             import pyttsx3
@@ -400,7 +430,6 @@ def read_aloud_callback():
             st.session_state["last_error_trace"] = traceback.format_exc()
             print("pyttsx3 not available, falling back to gTTS", e)
 
-    # Otherwise use gTTS -> in-memory mp3.
     st.session_state["status_message"] = "Generating audio..."
     audio_bytes = generate_audio_bytes(tts_text)
     if audio_bytes:
@@ -408,18 +437,16 @@ def read_aloud_callback():
         st.session_state["play_audio"] = True
         st.session_state["status_message"] = "Playing..."
 
-
 def stop_callback():
-    # Stop playback by clearing audio bytes and stopping render (removes embedded player)
     st.session_state["play_audio"] = False
     st.session_state["audio_bytes"] = None
     st.session_state["status_message"] = "Stopped."
-
 
 def clear_callback():
     st.session_state["query_text"] = ""
     st.session_state["voice_text"] = ""
     st.session_state["voice_audio_bytes"] = None
+    st.session_state["last_rec_payload"] = None
     st.session_state["last_answer"] = ""
     st.session_state["play_audio"] = False
     st.session_state["audio_bytes"] = None
@@ -454,12 +481,12 @@ def show_spinner_placeholder():
             pass
 
 # ---------------------------
-# Submit Query (kept separate so it can be used in callbacks)
+# Submit Query
 # ---------------------------
 
 def submit_query_internal():
     # If user recorded audio via browser, transcribe it first so voice_text/query_text are set
-    if st.session_state.get("voice_audio_bytes"):
+    if st.session_state.get("voice_audio_bytes") or st.session_state.get("last_rec_payload"):
         try:
             transcribe_recording_and_set_text()
         except Exception:
@@ -501,13 +528,10 @@ def submit_query_internal():
             st.session_state["status_message"] = f"DEBUG: Answer retrieved in {dur:.2f}s. See debug area."
             print(f"DEBUG: main.answer_query finished in {dur:.2f}s. type={type(answer)}, sample={sample!r}")
 
-            # Auto-read if user enabled it: generate/play audio for a shortened chunk to speed up
+            # Auto-read if user enabled it
             try:
                 if AUTO_READ:
-                    # Prepare text to speak (respect full-read checkbox)
                     tts_text_auto = str(answer) if READ_FULL_TTS else str(answer)[:TTS_CHARS_LIMIT]
-
-                    # If local TTS is preferred and available, use it (faster locally)
                     if USE_LOCAL_TTS:
                         try:
                             import pyttsx3
@@ -545,27 +569,23 @@ def submit_query_internal():
         print("DEBUG: submit_query_internal UNEXPECTED exception:", st.session_state["last_error_trace"])
         return
 
-
 def submit_query():
     submit_query_internal()
 
 # ---------------------------
-# Show answer and retrieved chunks
+# Show answer and chunks
 # ---------------------------
 
 def show_answer_and_chunks():
-    # show status message
     status = st.session_state.get("status_message", "")
     if status:
         st.markdown(f"<div style='text-align:center; font-weight:bold'>{status}</div>", unsafe_allow_html=True)
 
-    # show last error trace if present (collapsible)
     last_err = st.session_state.get("last_error_trace", "")
     if last_err:
         with st.expander("⚠️ Last error trace (click to expand)", expanded=False):
             st.code(last_err)
 
-    # Debug area hidden in an expander so user can toggle visibility
     with st.expander("🔧 Debug Output (click to show)", expanded=False):
         st.markdown("**Status message:**")
         st.write(st.session_state.get("status_message", ""))
@@ -573,7 +593,6 @@ def show_answer_and_chunks():
         if last_err:
             st.markdown("**Last error trace:**")
             st.code(last_err)
-        # show raw last_answer type and content for troubleshooting
         ans = st.session_state.get("last_answer")
         if ans is not None and ans != "":
             st.markdown("**DEBUG: last_answer type & length**")
@@ -597,11 +616,8 @@ def show_answer_and_chunks():
                     unsafe_allow_html=True,
                 )
 
-        # Audio playback area: will appear only when play_audio is True
         if st.session_state.get("play_audio") and st.session_state.get("audio_bytes"):
             try:
-                # Render an HTML5 audio player via components.html to reduce download UI.
-                # controlsList="nodownload" and oncontextmenu="return false" hide the browser's usual download buttons.
                 b64 = base64.b64encode(st.session_state.get("audio_bytes")).decode()
                 audio_html = f"""
                 <div style="text-align:center">
@@ -611,7 +627,6 @@ def show_answer_and_chunks():
                   </audio>
                 </div>
                 <script>
-                  // try to auto-play (may be blocked by browser policies)
                   const player = document.getElementById('player');
                   if (player) {{
                     player.play().catch(e => console.log('autoplay prevented', e));
@@ -624,7 +639,6 @@ def show_answer_and_chunks():
                 st.session_state["play_audio"] = False
                 st.session_state["audio_bytes"] = None
 
-        # Show retrieved chunks
         st.subheader("🔍 Retrieved Chunks (for transparency)")
         try:
             docs = []
@@ -658,7 +672,6 @@ with col1:
     st.text_input("Ask a legal question about India:", key="query_text")
 
 with col2:
-    # Always call browser/server listen function; it handles which method is available
     st.button("🎤 Speak", on_click=listen_to_voice)
     st.button("📨 Submit", on_click=submit_query)
 
@@ -666,7 +679,7 @@ with col2:
 show_answer_and_chunks()
 
 # ---------------------------
-# Audio Control Buttons (use callbacks to modify state inside callbacks)
+# Audio Control Buttons
 # ---------------------------
 if st.session_state.get("last_answer"):
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -686,10 +699,19 @@ with st.expander("⚙️ Diagnostics / Notes", expanded=False):
     st.write("Gemini key present:", bool(gemini_key))
     st.write("Use Gemini:", USE_GEMINI)
     st.write("Status message:", st.session_state.get("status_message", ""))
-
+    st.write("soundfile available:", True)
+    if st.session_state.get("last_rec_payload") is not None:
+        st.write("Last recorder payload preview:")
+        try:
+            rec = st.session_state.get("last_rec_payload")
+            if isinstance(rec, dict):
+                st.json({k: (str(v)[:300] + "..." if isinstance(v, (str, bytes)) and len(str(v))>300 else v) for k,v in list(rec.items())[:12]})
+            else:
+                st.write(str(rec)[:1000])
+        except Exception:
+            st.write("Could not preview recorder payload.")
     if st.session_state.get("last_error_trace"):
         st.write("Last error trace (short):")
-        st.code(st.session_state.get("last_error_trace")[:10000])  # truncate in UI
+        st.code(st.session_state.get("last_error_trace")[:10000])
+    st.write("If audio format is webm/mp3/opus and transcription fails, install pydub and ensure ffmpeg is on PATH for robust conversion.")
     st.write("Check the terminal where `streamlit run app.py` is running for the full stack trace and more info.")
-
-# End of file
