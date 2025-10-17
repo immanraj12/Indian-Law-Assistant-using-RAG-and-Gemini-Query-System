@@ -651,10 +651,20 @@ def show_answer_and_chunks():
 # UI Controls (main layout)
 # ---------------------------
 col1, col2 = st.columns([4, 1])
+if st.session_state.get("voice_text"):
+    # Only overwrite query_text if it's different (avoids unnecessary state churn)
+    if st.session_state.get("query_text", "") != st.session_state["voice_text"]:
+        # Safe to set because widget hasn't been created yet in this run
+        st.session_state["query_text"] = st.session_state["voice_text"]
+        st.session_state.pop("voice_text", None)  # optional: clear after sync
+
+# --- Now create the text input widget ---
 with col1:
-    # Populate the text input from voice_text (if present) so we can programmatically set it.
-    default_q = st.session_state.get("voice_text", st.session_state.get("query_text", ""))
-    st.text_input("Ask a legal question about India:", key="query_text", value=default_q)
+    st.text_input(
+        "Ask a legal question about India:",
+        key="query_text",
+        value=st.session_state.get("query_text", "")
+    )
 
 
 with col2:
